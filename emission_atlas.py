@@ -3,7 +3,7 @@ bl_info = {
     "blender": (4, 1, 1),
     "category": "Material",
     "author": "Bryce Bible",
-    "version": (1, 3),
+    "version": (1, 4),
     "description": "Converts simple emission materials into a texture atlas, with revert/unpack functionality.",
 }
 
@@ -173,7 +173,7 @@ def create_single_color_emission_material(name, color):
 # -----------------------------------------------------------------------------
 class ConvertToEmissionAtlas(bpy.types.Operator):
     """
-    Converts all simple emission materials in the selected objects
+    Converts all simple emission materials in selected objects
     into a single texture atlas material, replacing the original materials.
     """
     bl_idname = "object.convert_to_emission_atlas"
@@ -181,6 +181,9 @@ class ConvertToEmissionAtlas(bpy.types.Operator):
     bl_description = "Converts simple emission materials to a single atlas and reassigns them."
     
     def execute(self, context):
+        global ORIGINAL_MATERIALS
+        ORIGINAL_MATERIALS.clear()  # Reset stored materials
+        
         # 1. Gather all simple emission materials
         materials = get_simple_emission_materials()
         if not materials:
@@ -188,9 +191,7 @@ class ConvertToEmissionAtlas(bpy.types.Operator):
             return {'CANCELLED'}
         
         # 2. Create a dictionary that maps each material to a unique index
-        mat_index_map = {}
-        for idx, mat_name in enumerate(materials.keys()):
-            mat_index_map[mat_name] = idx
+        mat_index_map = {mat_name: idx for idx, mat_name in enumerate(materials.keys())}
         
         # 3. Create the atlas texture
         atlas = create_texture_atlas(materials)
@@ -201,34 +202,38 @@ class ConvertToEmissionAtlas(bpy.types.Operator):
         # 4. Create a single new material using the atlas
         atlas_mat = create_atlas_material(atlas)
         
-        # 5. Store original materials for revert
-        global ORIGINAL_MATERIALS
-        ORIGINAL_MATERIALS.clear()  # Reset each time we run
-        
-        # 6. For each selected mesh object, store old mats, then remap UVs, assign atlas
         for obj in context.selected_objects:
-            if obj.type == "MESH":
-                # Store original materials
-                ORIGINAL_MATERIALS[obj.name] = [ms.material for ms in obj.material_slots]
-                
-                # Update UVs
-                remap_uvs(obj, mat_index_map, atlas_width=atlas.size[0], atlas_height=atlas.size[1])
-                
-                # Replace all materials with the new atlas
-                obj.data.materials.clear()
-                obj.data.materials.append(atlas_mat)
+            if obj.type != "MESH":
+                continue
+
+            # Store original materials & face material indices
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            
+            ORIGINAL_MATERIALS[obj.name] = {
+                "materials": [ms.material for ms in obj.material_slots],
+                "material_indices": [face.material_index for face in bm.faces],
+            }
+            
+            bm.free()
+            
+            # Update UVs
+            remap_uvs(obj, mat_index_map, atlas_width=atlas.size[0], atlas_height=atlas.size[1])
+            
+            # Replace all materials with the new atlas
+            obj.data.materials.clear()
+            obj.data.materials.append(atlas_mat)
         
         self.report({'INFO'}, "Emission Texture Atlas Generated Successfully!")
         return {'FINISHED'}
 
-
 class RevertEmissionAtlas(bpy.types.Operator):
     """
-    Revert selected objects to their original materials (only if still in memory).
+    Reverts objects back to their original materials (including material indices).
     """
     bl_idname = "object.revert_emission_atlas"
     bl_label = "Revert Atlas"
-    bl_description = "Reverts selected objects to their original materials if possible."
+    bl_description = "Reverts selected objects to their original materials and material assignments."
     
     def execute(self, context):
         global ORIGINAL_MATERIALS
@@ -238,19 +243,50 @@ class RevertEmissionAtlas(bpy.types.Operator):
             return {'CANCELLED'}
         
         for obj in context.selected_objects:
-            if obj.name in ORIGINAL_MATERIALS:
-                mat_list = ORIGINAL_MATERIALS[obj.name]
-                if obj.type == 'MESH':
-                    # Clear current materials
-                    obj.data.materials.clear()
-                    # Re-add the originals (if they still exist)
-                    for mat in mat_list:
-                        if mat and mat.name in bpy.data.materials:
-                            obj.data.materials.append(bpy.data.materials[mat.name])
-        
-        self.report({'INFO'}, "Reverted to original materials.")
-        return {'FINISHED'}
+            if obj.name not in ORIGINAL_MATERIALS:
+                # This object wasn't stored; skip
+                continue
 
+            mat_data = ORIGINAL_MATERIALS[obj.name]
+            
+            if obj.type == 'MESH':
+                # 1) Clear current material slots
+                obj.data.materials.clear()
+
+                # 2) Recreate the original material slots
+                restored_materials = []
+                for stored_mat in mat_data["materials"]:
+                    if stored_mat and stored_mat.name in bpy.data.materials:
+                        restored_materials.append(bpy.data.materials[stored_mat.name])
+                    else:
+                        # Option A: Skip None or missing materials
+                        # (But this changes the material slot count.)
+                        # continue
+
+                        # Option B: Insert a dummy so face indices remain valid
+                        dummy_mat = bpy.data.materials.new(name="DummyMaterial")
+                        restored_materials.append(dummy_mat)
+
+                # 3) Append each material individually
+                for mat in restored_materials:
+                    obj.data.materials.append(mat)
+
+                # 4) Restore face material indices
+                bm = bmesh.new()
+                bm.from_mesh(obj.data)
+                
+                if "material_indices" in mat_data:
+                    material_indices = mat_data["material_indices"]
+                    for face in bm.faces:
+                        # Make sure we have a stored index for this face
+                        if face.index < len(material_indices):
+                            face.material_index = material_indices[face.index]
+                
+                bm.to_mesh(obj.data)
+                bm.free()
+
+        self.report({'INFO'}, "Successfully reverted to original materials.")
+        return {'FINISHED'}
 
 class UnpackEmissionAtlas(bpy.types.Operator):
     """
